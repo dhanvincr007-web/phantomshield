@@ -27,6 +27,7 @@ import {
 import GraphView, { GraphNode, GraphEdge } from "@/components/GraphView";
 import ShellView from "@/components/ShellView";
 import CTIView, { BlastRadiusReport, ChokePoint, TelemetryEvent } from "@/components/CTIView";
+import JarvisVoiceAssistant from "@/components/JarvisVoiceAssistant";
 
 const RAW_API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const API_BASE = RAW_API_BASE.trim().replace(/\/+$/, "");
@@ -708,6 +709,9 @@ export default function DashboardPage() {
             <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
             <span>🔄 Reset Infrastructure Graph</span>
           </button>
+
+          {/* J.A.R.V.I.S. Voice Assistant Widget */}
+          <JarvisVoiceAssistant wsUrl={WS_BASE} apiBase={API_BASE} />
 
           {/* Team Info Button */}
           <button

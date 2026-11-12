@@ -177,6 +177,17 @@ class JarvisSentinel:
             payload["contained"] = True
             payload["action_enforced"] = "AUTONOMOUS_MICRO_SEGMENTATION"
             payload["reasoning"] = f"{reason} Blast radius collapsed to 0.0% (SECURE)."
+
+            # Voice briefing for the J.A.R.V.I.S. Voice Assistant widget
+            node_name = node_id.replace("-", " ").replace("_", " ").title()
+            payload["voice_briefing"] = (
+                f"Alert, sir. A high-value canary token has been breached on {node_name}. "
+                f"I have autonomously severed all outgoing egress connections and "
+                f"collapsed the blast radius to zero. "
+                f"The network is now secure. Incident report dispatched to Team Lead. "
+                f"Awaiting your instructions, sir."
+            )
+
             self.last_intervention = payload
 
         self.decision_log.append(payload)

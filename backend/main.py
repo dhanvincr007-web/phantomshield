@@ -6,12 +6,14 @@ Team: Dhanvin (Lead), Pragathish Palsamy, P.V. Krishnan, Mohamed Annas, MANO G
 
 import asyncio
 import datetime
+import io
 import json
 import logging
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from database import check_connection, seed_database, get_full_graph, update_node_status
@@ -26,6 +28,8 @@ from graph_ops import (
 )
 from llm_sandbox import handle_deception_command
 from ai_sentinel import jarvis_sentinel
+from notifier import jarvis_notifier
+from voice_engine import jarvis_voice
 
 logger = logging.getLogger("phantomshield.api")
 logging.basicConfig(level=logging.INFO)
@@ -230,6 +234,12 @@ class ContainmentRequest(BaseModel):
 class SentinelModeRequest(BaseModel):
     mode: str
 
+class SpeakRequest(BaseModel):
+    text: str
+
+class AskRequest(BaseModel):
+    query: str
+
 # ---------------------------------------------------------------------------
 # Root & Health
 # ---------------------------------------------------------------------------
@@ -258,6 +268,10 @@ def read_root():
             "execute": "/api/execute",
             "seed": "/api/seed",
             "sentinel_status": "/api/sentinel/status",
+            "notifications_status": "/api/notifications/status",
+            "notifications_test": "/api/notifications/test-dispatch",
+            "jarvis_speak": "/api/jarvis/speak",
+            "jarvis_ask": "/api/jarvis/ask",
             "ws_telemetry": "/ws/telemetry",
         },
     }
@@ -402,6 +416,146 @@ async def set_sentinel_mode(payload: SentinelModeRequest):
     return status
 
 # ---------------------------------------------------------------------------
+# J.A.R.V.I.S. Multi-Channel Alert Dispatcher Routes
+# ---------------------------------------------------------------------------
+
+class TestNotificationRequest(BaseModel):
+    custom_message: Optional[str] = None
+    target_node: Optional[str] = "decoy-ssh-01"
+
+@app.get("/api/notifications/status")
+@app.get("/api/notifications/config")
+def get_notification_status():
+    """Retrieve configuration and delivery channel status for J.A.R.V.I.S. Alert Dispatcher."""
+    return jarvis_notifier.get_status()
+
+@app.get("/api/notifications/history")
+def get_notification_history():
+    """Retrieve rolling history of recent outbound security alerts."""
+    return {
+        "total_dispatches": jarvis_notifier.total_dispatches,
+        "history": list(reversed(jarvis_notifier.dispatch_history))
+    }
+
+@app.post("/api/notifications/test-dispatch")
+@app.post("/api/notifications/test")
+async def trigger_test_dispatch(payload: Optional[TestNotificationRequest] = None):
+    """Trigger manual test dispatch across Gmail SMTP, Twilio SMS, and ntfy.sh push."""
+    msg = payload.custom_message if payload else None
+    dispatch_record = await jarvis_notifier.test_dispatch(custom_note=msg)
+    
+    await telemetry_manager.broadcast({
+        "event_type": "NOTIFICATION_DISPATCHED",
+        "channels": dispatch_record.get("channels", {}),
+        "recipient_email": jarvis_notifier.email_recipient,
+        "recipient_phone": jarvis_notifier.alert_phone,
+        "summary": f"[J.A.R.V.I.S. NOTIFIER TEST] Alert routed to {jarvis_notifier.email_recipient} & {jarvis_notifier.alert_phone}."
+    })
+    
+    return {
+        "status": "success",
+        "message": f"Alert dispatched across Email, SMS, and Push to {jarvis_notifier.email_recipient} & {jarvis_notifier.alert_phone}",
+        "dispatch_record": dispatch_record
+    }
+
+# ---------------------------------------------------------------------------
+# J.A.R.V.I.S. Voice Engine Routes (British Butler Neural TTS + STT Intent)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/jarvis/speak")
+async def jarvis_speak(payload: SpeakRequest):
+    """Synthesize J.A.R.V.I.S. British butler speech from text → MP3 audio stream."""
+    try:
+        audio_bytes = await jarvis_voice.synthesize(payload.text)
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "inline; filename=jarvis_response.mp3",
+                "X-JARVIS-Text": payload.text[:200],
+            },
+        )
+    except Exception as exc:
+        logger.error("[J.A.R.V.I.S. VOICE] Synthesis failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Voice synthesis failed: {exc}")
+
+
+@app.post("/api/jarvis/ask")
+async def jarvis_ask(payload: AskRequest):
+    """
+    Process a spoken operator query through J.A.R.V.I.S. intent pipeline:
+      1. Parse intent (status / containment / simulate / reset / generic)
+      2. Gather live graph state
+      3. Execute graph actions if requested
+      4. Build British butler text response
+      5. Return text + action metadata (audio fetched separately via /api/jarvis/speak)
+    """
+    intent = jarvis_voice.parse_intent(payload.query)
+    response_text = ""
+    action_taken = "none"
+    action_data = {}
+
+    if intent == "status":
+        # Gather live graph state
+        blast = get_blast_radius("decoy-ssh-01", max_hops=3)
+        choke = get_choke_points()
+        brvi = blast.get("blast_radius_index", 0)
+        choke_count = len(choke.get("strategic_choke_points", []))
+        compromised = blast.get("total_reachable_assets", 0)
+        response_text = jarvis_voice.build_status_briefing(
+            brvi=brvi,
+            choke_points=choke_count,
+            compromised_nodes=compromised,
+            mode=jarvis_sentinel.mode,
+        )
+        action_taken = "status_report"
+        action_data = {"brvi": brvi, "choke_points": choke_count, "mode": jarvis_sentinel.mode}
+
+    elif intent == "containment":
+        # Execute containment on the most likely compromised node
+        target = "decoy-ssh-01"
+        containment_res = contain_threat(target)
+        update_node_status(target, "ISOLATED", notes="J.A.R.V.I.S. voice-commanded quarantine")
+        await telemetry_manager.broadcast_graph_mutation_containment(
+            node_id=target,
+            severed_edges=containment_res.get("severed_edges_count", 0),
+            pre_risk=92.0,
+            post_risk=0.0,
+        )
+        await telemetry_manager.broadcast_node_mutation(target, "ISOLATED", "J.A.R.V.I.S. voice-commanded micro-segmentation")
+        response_text = jarvis_voice.build_containment_briefing(target)
+        action_taken = "containment_executed"
+        action_data = {"target_node": target, "containment": containment_res}
+
+    elif intent == "simulate":
+        response_text = jarvis_voice.build_simulation_briefing()
+        action_taken = "simulation_triggered"
+        # Fire the scenario in the background so the voice responds immediately
+        asyncio.create_task(run_scenario_attack_chain())
+
+    elif intent == "reset":
+        seed_database()
+        await telemetry_manager.broadcast({
+            "event_type": "GRAPH_RESET",
+            "summary": "Infrastructure graph restored to HEALTHY baseline by J.A.R.V.I.S. voice command.",
+        })
+        response_text = jarvis_voice.build_reset_briefing()
+        action_taken = "graph_reset"
+
+    else:
+        response_text = jarvis_voice.build_generic_response(payload.query)
+        action_taken = "generic_response"
+
+    return {
+        "text": response_text,
+        "intent": intent,
+        "action": action_taken,
+        "action_data": action_data,
+        "query": payload.query,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Shell / Deception Proxy
 # ---------------------------------------------------------------------------
 
@@ -455,6 +609,23 @@ async def execute_shell_command(payload: ShellCommandRequest):
             mode=jarvis_sentinel.mode,
             mitre_tactic=result.get("mitre_technique", {}).get("technique_id", "T1003.008"),
         )
+        # Dispatch multi-channel notification to primary contacts (dhanvincr007@gmail.com & +917708720395)
+        dispatch_res = await jarvis_notifier.dispatch_incident_alert({
+            "severity": "CRITICAL",
+            "title": f"Autonomous Micro-Segmentation on {target_node}",
+            "target_node": target_node,
+            "mitre_id": result.get("mitre_technique", {}).get("technique_id", "T1552.004"),
+            "reasoning": jarvis_eval.get("reasoning", "Autonomous micro-segmentation enforced by J.A.R.V.I.S."),
+            "brvi": "92% -> 0.0% (SECURE)"
+        })
+        result["notification_dispatch"] = dispatch_res
+        await telemetry_manager.broadcast({
+            "event_type": "NOTIFICATION_DISPATCHED",
+            "channels": dispatch_res.get("channels", {}),
+            "recipient_email": jarvis_notifier.email_recipient,
+            "recipient_phone": jarvis_notifier.alert_phone,
+            "summary": f"[J.A.R.V.I.S. NOTIFIER] Outbound incident alert dispatched to {jarvis_notifier.email_recipient} & {jarvis_notifier.alert_phone}."
+        })
 
     return result
 
