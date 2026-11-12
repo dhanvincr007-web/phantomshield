@@ -14,10 +14,23 @@ load_dotenv()
 logger = logging.getLogger("phantomshield.database")
 logging.basicConfig(level=logging.INFO)
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "phantomshield2026")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+def _clean_env(val: Optional[str], default: str = "") -> str:
+    """Sanitize environment variables, removing wrapping quotes and whitespace."""
+    if not val:
+        return default
+    cleaned = val.strip().strip("'\"")
+    return cleaned if cleaned else default
+
+NEO4J_URI = _clean_env(os.getenv("NEO4J_URI"), "bolt://localhost:7687")
+NEO4J_USER = _clean_env(os.getenv("NEO4J_USER"), "neo4j")
+NEO4J_PASSWORD = _clean_env(os.getenv("NEO4J_PASSWORD"), "phantomshield2026")
+NEO4J_DATABASE = _clean_env(os.getenv("NEO4J_DATABASE"), "neo4j")
+
+# Flag for cloud Neo4j AuraDB instances
+IS_AURADB = (
+    "databases.neo4j.io" in NEO4J_URI 
+    or NEO4J_URI.startswith(("neo4j+s://", "neo4j+ssc://", "bolt+s://"))
+)
 
 # In-memory mock store fallback when Neo4j is not reachable locally
 IN_MEMORY_NODES: Dict[str, Dict[str, Any]] = {}
@@ -156,8 +169,8 @@ INITIAL_TOPOLOGY_NODES = [
     },
     # AI Deception Honey Traps
     {
-        "id": "Honey-Bastion-SSH",
-        "name": "Decoy Jumpbox (Honey-Bastion)",
+        "id": "decoy-ssh-01",
+        "name": "Decoy SSH Jumpbox (Honey-Bastion)",
         "label": "Honeypot",
         "type": "honeypot",
         "ip": "10.0.1.99",
@@ -167,6 +180,19 @@ INITIAL_TOPOLOGY_NODES = [
         "vulnerability": "Default Root Credential Trap",
         "cve": "T1078.001",
         "description": "High-interaction deceptive SSH proxy equipped with AI prompt deception"
+    },
+    {
+        "id": "Honey-Bastion-SSH",
+        "name": "Decoy SSH Jumpbox (Alias)",
+        "label": "Honeypot",
+        "type": "honeypot",
+        "ip": "10.0.1.99",
+        "os": "Alpine Linux (AI Emulated Shell)",
+        "criticality": "Honeypot",
+        "status": "DECOY",
+        "vulnerability": "Default Root Credential Trap",
+        "cve": "T1078.001",
+        "description": "Secondary honeypot alias for Decoy SSH"
     },
     {
         "id": "HoneyToken-AdminKey",
@@ -211,14 +237,17 @@ INITIAL_TOPOLOGY_NODES = [
 
 INITIAL_TOPOLOGY_EDGES = [
     {"id": "e1", "source": "Internet-Gateway", "target": "DMZ-Web-Prod", "relationship": "ROUTES_TRAFFIC_TO", "protocol": "HTTPS", "port": 443, "weight": 1.0, "status": "ACTIVE"},
-    {"id": "e2", "source": "Internet-Gateway", "target": "Honey-Bastion-SSH", "relationship": "ROUTES_TRAFFIC_TO", "protocol": "SSH", "port": 2222, "weight": 0.5, "status": "DECEPTIVE"},
+    {"id": "e2", "source": "Internet-Gateway", "target": "decoy-ssh-01", "relationship": "ROUTES_TRAFFIC_TO", "protocol": "SSH", "port": 2222, "weight": 0.5, "status": "DECEPTIVE"},
+    {"id": "e2_alias", "source": "Internet-Gateway", "target": "Honey-Bastion-SSH", "relationship": "ROUTES_TRAFFIC_TO", "protocol": "SSH", "port": 2222, "weight": 0.5, "status": "DECEPTIVE"},
     {"id": "e3", "source": "DMZ-Web-Prod", "target": "API-Gateway-01", "relationship": "CONNECTS_TO", "protocol": "mTLS", "port": 8443, "weight": 1.5, "status": "ACTIVE"},
     {"id": "e4", "source": "API-Gateway-01", "target": "Auth-Service-OAuth", "relationship": "AUTHENTICATES_VIA", "protocol": "OIDC", "port": 8080, "weight": 2.0, "status": "ACTIVE"},
     {"id": "e5", "source": "DMZ-Web-Prod", "target": "Internal-Core-Switch", "relationship": "CROSSES_SUBNET", "protocol": "TCP", "port": 0, "weight": 3.0, "status": "ACTIVE"},
+    {"id": "e5_decoy", "source": "decoy-ssh-01", "target": "Internal-Core-Switch", "relationship": "PIVOT_EXPLOIT", "protocol": "SSH_TUNNEL", "port": 22, "weight": 2.5, "status": "ACTIVE"},
     {"id": "e6", "source": "Internal-Core-Switch", "target": "DevOps-Workstation-04", "relationship": "CONNECTS_TO", "protocol": "RDP", "port": 3389, "weight": 2.5, "status": "ACTIVE"},
     {"id": "e7", "source": "DevOps-Workstation-04", "target": "Production-K8s-Cluster", "relationship": "ADMIN_ACCESS", "protocol": "KUBECTL", "port": 6443, "weight": 3.5, "status": "ACTIVE"},
     {"id": "e8", "source": "DMZ-Web-Prod", "target": "Canary-File-Passwd", "relationship": "CONTAINS_CANARY", "protocol": "LOCAL_FS", "port": 0, "weight": 0.2, "status": "DECEPTIVE"},
-    {"id": "e9", "source": "Honey-Bastion-SSH", "target": "HoneyToken-AdminKey", "relationship": "LEADS_TO_TRAP", "protocol": "TOKEN_READ", "port": 0, "weight": 0.1, "status": "DECEPTIVE"},
+    {"id": "e9", "source": "decoy-ssh-01", "target": "HoneyToken-AdminKey", "relationship": "LEADS_TO_TRAP", "protocol": "TOKEN_READ", "port": 0, "weight": 0.1, "status": "DECEPTIVE"},
+    {"id": "e9_alias", "source": "Honey-Bastion-SSH", "target": "HoneyToken-AdminKey", "relationship": "LEADS_TO_TRAP", "protocol": "TOKEN_READ", "port": 0, "weight": 0.1, "status": "DECEPTIVE"},
     {"id": "e10", "source": "Canary-File-Passwd", "target": "Honey-CRM-Database", "relationship": "REFERENCES_DECOY", "protocol": "DB_CONN", "port": 3306, "weight": 0.4, "status": "DECEPTIVE"},
     {"id": "e11", "source": "Internal-Core-Switch", "target": "AD-Domain-Controller", "relationship": "LATERAL_MOVEMENT_PATH", "protocol": "SMB/RPC", "port": 445, "weight": 4.0, "status": "ACTIVE"},
     {"id": "e12", "source": "DevOps-Workstation-04", "target": "AD-Domain-Controller", "relationship": "PIVOT_EXPLOIT", "protocol": "WINRM", "port": 5985, "weight": 3.8, "status": "ACTIVE"},
@@ -236,20 +265,32 @@ def get_neo4j_driver():
         return driver
     try:
         from neo4j import GraphDatabase
+
+        if IS_AURADB:
+            logger.info(f"Configuring TLS encrypted connection for Neo4j AuraDB: {NEO4J_URI}")
+        else:
+            logger.info(f"Configuring standard connection for Neo4j instance: {NEO4J_URI}")
+
         driver = GraphDatabase.driver(
             NEO4J_URI,
             auth=(NEO4J_USER, NEO4J_PASSWORD),
             max_connection_lifetime=30 * 60,
             max_connection_pool_size=50,
-            connection_acquisition_timeout=2.0
+            connection_acquisition_timeout=15.0,
+            connection_timeout=15.0
         )
-        # Verify connection
+        # Verify connection and connectivity with database
         with driver.session(database=NEO4J_DATABASE) as session:
             session.run("RETURN 1 AS test")
-        logger.info(f"Connected successfully to Neo4j instance at {NEO4J_URI}")
+        
+        mode_label = "Neo4j AuraDB (Cloud)" if IS_AURADB else "Neo4j Native"
+        logger.info(f"Connected successfully to {mode_label} instance at {NEO4J_URI}")
         return driver
     except Exception as e:
-        logger.warning(f"Neo4j instance offline or unreachable ({e}). Using high-fidelity In-Memory Graph Engine.")
+        logger.warning(
+            f"Neo4j instance offline or unreachable ({e}). "
+            f"Activating zero-downtime high-fidelity In-Memory Graph Engine fallback."
+        )
         driver = None
         return None
 
@@ -261,10 +302,21 @@ def check_connection() -> Dict[str, Any]:
             with drv.session(database=NEO4J_DATABASE) as session:
                 res = session.run("RETURN 1 AS connected").single()
                 if res and res["connected"] == 1:
-                    return {"status": "connected", "mode": "neo4j_native", "uri": NEO4J_URI}
+                    return {
+                        "status": "connected",
+                        "mode": "neo4j_auradb" if IS_AURADB else "neo4j_native",
+                        "uri": NEO4J_URI,
+                        "database": NEO4J_DATABASE,
+                        "tls_encrypted": IS_AURADB
+                    }
         except Exception as e:
             return {"status": "degraded", "mode": "in_memory_simulation", "error": str(e)}
-    return {"status": "active_in_memory", "mode": "in_memory_simulation", "nodes_count": len(IN_MEMORY_NODES)}
+    return {
+        "status": "active_in_memory",
+        "mode": "in_memory_simulation",
+        "nodes_count": len(IN_MEMORY_NODES),
+        "note": "Zero-downtime resilient in-memory fallback active"
+    }
 
 def seed_database():
     """Seed the graph database with full cyber topology and AI deception nodes."""
@@ -422,6 +474,37 @@ def isolate_node_edges(node_id: str) -> List[str]:
             logger.warning(f"Failed to isolate edges in Neo4j for {node_id}: {e}")
 
     return severed_edge_ids
+
+class GraphEngine:
+    """
+    Robust GraphEngine class wrapping official Neo4j Driver with
+    zero-downtime In-Memory Fallback Graph.
+    """
+    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD, database: str = NEO4J_DATABASE):
+        self.uri = uri
+        self.user = user
+        self.password = password
+        self.database = database
+
+    def get_driver(self):
+        return get_neo4j_driver()
+
+    def check_connection(self) -> Dict[str, Any]:
+        return check_connection()
+
+    def seed_database(self) -> Dict[str, Any]:
+        return seed_database()
+
+    def get_full_graph(self) -> Dict[str, Any]:
+        return get_full_graph()
+
+    def update_node_status(self, node_id: str, new_status: str, notes: Optional[str] = None) -> bool:
+        return update_node_status(node_id, new_status, notes)
+
+    def isolate_node_edges(self, node_id: str) -> List[str]:
+        return isolate_node_edges(node_id)
+
+graph_engine = GraphEngine()
 
 # Ensure graph is seeded into memory upon module load
 if not IN_MEMORY_NODES:

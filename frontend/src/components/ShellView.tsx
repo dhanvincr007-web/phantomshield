@@ -62,13 +62,10 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputCmd.trim() || isExecuting) return;
-
-    const cmd = inputCmd.trim();
-    setInputCmd("");
+  const executeCommandInternal = async (cmd: string) => {
+    if (!cmd.trim() || isExecuting) return;
     setIsExecuting(true);
+    setInputCmd(cmd);
 
     const now = new Date().toLocaleTimeString();
 
@@ -79,9 +76,9 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
         {
           id: Math.random().toString(),
           command: cmd,
-          output: res.output,
-          mitre: res.mitre_technique,
-          alert: res.alert_details,
+          output: res?.output || `[Command executed: ${cmd}]`,
+          mitre: res?.mitre_technique,
+          alert: res?.alert_details,
           timestamp: now
         }
       ]);
@@ -100,8 +97,18 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
     }
   };
 
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputCmd.trim() || isExecuting) return;
+
+    const cmd = inputCmd.trim();
+    setInputCmd("");
+    await executeCommandInternal(cmd);
+  };
+
   const handleRunPreset = (cmd: string) => {
     setInputCmd(cmd);
+    executeCommandInternal(cmd);
   };
 
   const clearTerminal = () => {

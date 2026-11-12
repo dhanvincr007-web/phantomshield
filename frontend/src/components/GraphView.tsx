@@ -1,22 +1,22 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { 
-  ShieldAlert, 
-  Server, 
-  Lock, 
-  Sparkles, 
-  Database, 
-  Key, 
-  RefreshCw, 
-  Zap, 
-  Eye, 
-  Radio, 
-  Cpu, 
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  ShieldAlert,
+  Server,
+  Lock,
+  Sparkles,
+  Database,
+  RefreshCw,
+  Radio,
+  Cpu,
   Activity,
   Maximize2,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Layers,
+  Network,
+  Zap,
 } from "lucide-react";
 
 export interface GraphNode {
@@ -33,6 +33,7 @@ export interface GraphNode {
   description?: string;
   x?: number;
   y?: number;
+  last_alert?: string;
 }
 
 export interface GraphEdge {
@@ -57,7 +58,16 @@ interface GraphViewProps {
   isSimulating: boolean;
 }
 
-// Initial deterministic 2D layout coordinates for consistent, clean layout
+// ---- Visual effect state ---------------------------------------------------
+type FlashState = "ATTACK" | "CANARY" | "ISOLATED" | null;
+
+interface NodeFlash {
+  nodeId: string;
+  state: FlashState;
+  expiresAt: number; // Date.now() + duration ms
+}
+
+// ---- Default layout --------------------------------------------------------
 const DEFAULT_NODE_POSITIONS: Record<string, { x: number; y: number }> = {
   "Internet-Gateway": { x: 100, y: 260 },
   "DMZ-Web-Prod": { x: 280, y: 170 },
@@ -73,18 +83,26 @@ const DEFAULT_NODE_POSITIONS: Record<string, { x: number; y: number }> = {
   "AD-Domain-Controller": { x: 800, y: 310 },
   "CrownJewel-Vault-DB": { x: 970, y: 250 },
   "Backup-DR-Storage": { x: 1100, y: 360 },
+  "decoy-ssh-01": { x: 280, y: 390 },
 };
 
+// ---- API base --------------------------------------------------------------
+const RAW_API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = RAW_API_BASE.trim().replace(/\/+$/, "");
+const WS_BASE = API_BASE.replace(/^http/, "ws");
+
+// ===========================================================================
 export default function GraphView({
-  nodes,
-  edges,
+  nodes: propNodes,
+  edges: propEdges,
   selectedNodeId,
   blastRadiusNodes,
   onSelectNode,
   onContainNode,
   onRefresh,
-  isSimulating
+  isSimulating,
 }: GraphViewProps) {
+  const [engineMode, setEngineMode] = useState<"force" | "cytoscape">("force");
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(DEFAULT_NODE_POSITIONS);
   const [draggingNode, setDraggingNode] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
@@ -92,13 +110,33 @@ export default function GraphView({
   const [pan, setPan] = useState({ x: 20, y: 30 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const svgRef = useRef<SVGSVGElement | null>(null);
 
-  // Auto-align coordinates on mount or when nodes change
+  // Live topology state (overlays props with real-time WS mutations)
+  const [liveNodes, setLiveNodes] = useState<GraphNode[]>(propNodes);
+  const [liveEdges, setLiveEdges] = useState<GraphEdge[]>(propEdges);
+
+  // Flash animation registry: nodeId → FlashState
+  const [flashMap, setFlashMap] = useState<Record<string, FlashState>>({});
+
+  // WS connection indicator inside this component
+  const [wsLive, setWsLive] = useState(false);
+
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const cyContainerRef = useRef<HTMLDivElement | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cyInstanceRef = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- Sync props → live state when parent refreshes ----------------------
+  useEffect(() => { setLiveNodes(propNodes); }, [propNodes]);
+  useEffect(() => { setLiveEdges(propEdges); }, [propEdges]);
+
+  // ---- Auto-layout new nodes ----------------------------------------------
   useEffect(() => {
     setPositions(prev => {
       const updated = { ...prev };
-      nodes.forEach((node, idx) => {
+      propNodes.forEach((node, idx) => {
         if (!updated[node.id]) {
           const col = Math.floor(idx / 3);
           const row = idx % 3;
@@ -107,16 +145,266 @@ export default function GraphView({
       });
       return updated;
     });
-  }, [nodes]);
+  }, [propNodes]);
 
+  // ---- Flash helper -------------------------------------------------------
+  const triggerFlash = useCallback((nodeId: string, state: FlashState, durationMs = 2500) => {
+    setFlashMap(prev => ({ ...prev, [nodeId]: state }));
+    setTimeout(() => {
+      setFlashMap(prev => {
+        const next = { ...prev };
+        if (next[nodeId] === state) delete next[nodeId];
+        return next;
+      });
+    }, durationMs);
+  }, []);
+
+  // ---- WebSocket subscription (internal to GraphView) ---------------------
+  useEffect(() => {
+    let destroyed = false;
+
+    const connect = () => {
+      if (destroyed) return;
+      try {
+        const ws = new WebSocket(`${WS_BASE}/ws/telemetry`);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (!destroyed) setWsLive(true);
+        };
+
+        ws.onmessage = (evt) => {
+          if (destroyed) return;
+          try {
+            const data = JSON.parse(evt.data);
+            handleWsEvent(data);
+          } catch {
+            // ignore malformed frames
+          }
+        };
+
+        ws.onclose = () => {
+          if (!destroyed) {
+            setWsLive(false);
+            reconnectTimerRef.current = setTimeout(connect, 3000);
+          }
+        };
+
+        ws.onerror = () => ws.close();
+      } catch {
+        if (!destroyed) {
+          reconnectTimerRef.current = setTimeout(connect, 3000);
+        }
+      }
+    };
+
+    connect();
+
+    return () => {
+      destroyed = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      wsRef.current?.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- Handle incoming WS topology-mutation events ------------------------
+  const handleWsEvent = useCallback((data: Record<string, unknown>) => {
+    const type = data.event_type as string;
+
+    switch (type) {
+      // ---- Node compromised (canary breach / attack) -----------------------
+      case "ATTACK_COMMAND_EXECUTED": {
+        const nodeId = data.target_node as string;
+        if (nodeId) triggerFlash(nodeId, "ATTACK", 1800);
+        break;
+      }
+
+      case "CANARY_BREACH_DETECTED": {
+        const nodeId = data.node_id as string;
+        if (nodeId) {
+          triggerFlash(nodeId, "CANARY", 3000);
+          // Immediately reflect compromised state in live graph
+          setLiveNodes(prev =>
+            prev.map(n => n.id === nodeId ? { ...n, status: "COMPROMISED" } : n)
+          );
+        }
+        break;
+      }
+
+      // ---- Generic node status mutation ------------------------------------
+      case "NODE_STATUS_CHANGED": {
+        const nodeId = data.node_id as string;
+        const newStatus = data.new_status as GraphNode["status"];
+        if (!nodeId || !newStatus) break;
+
+        setLiveNodes(prev =>
+          prev.map(n => n.id === nodeId ? { ...n, status: newStatus } : n)
+        );
+
+        if (newStatus === "COMPROMISED") triggerFlash(nodeId, "CANARY", 3000);
+        else if (newStatus === "ISOLATED") triggerFlash(nodeId, "ISOLATED", 2000);
+        break;
+      }
+
+      // ---- Edge severed ---------------------------------------------------
+      case "EDGE_SEVERED": {
+        const src = data.source as string;
+        const tgt = data.target as string;
+        setLiveEdges(prev =>
+          prev.map(e =>
+            (e.source === src && e.target === tgt) ||
+            (e.source === tgt && e.target === src)
+              ? { ...e, status: "QUARANTINED" }
+              : e
+          )
+        );
+        break;
+      }
+
+      // ---- Containment topology mutation -----------------------------------
+      case "GRAPH_MUTATED_CONTAINMENT":
+      case "NODE_CONTAINED": {
+        const nodeId = (data.node_id as string) || "";
+        if (nodeId) {
+          triggerFlash(nodeId, "ISOLATED", 2500);
+          setLiveNodes(prev =>
+            prev.map(n =>
+              n.id === nodeId || n.status === "COMPROMISED"
+                ? { ...n, status: "ISOLATED" }
+                : n
+            )
+          );
+          // Sever all edges from that node
+          setLiveEdges(prev =>
+            prev.map(e =>
+              e.source === nodeId || e.target === nodeId
+                ? { ...e, status: "QUARANTINED" }
+                : e
+            )
+          );
+        }
+        break;
+      }
+
+      // ---- J.A.R.V.I.S. intervention (Step 5 of scenario) ----------------
+      case "SENTINEL_SAFEGUARD_TRIGGERED": {
+        const tgt = data.target_node as string;
+        if (tgt) {
+          triggerFlash(tgt, "ISOLATED", 3000);
+          setLiveNodes(prev =>
+            prev.map(n =>
+              n.id === tgt ? { ...n, status: "ISOLATED" } : n
+            )
+          );
+          setLiveEdges(prev =>
+            prev.map(e =>
+              e.source === tgt || e.target === tgt
+                ? { ...e, status: "QUARANTINED" }
+                : e
+            )
+          );
+        }
+        break;
+      }
+
+      // ---- Full graph reset -----------------------------------------------
+      case "GRAPH_RESET":
+      case "GRAPH_SEEDED":
+        // Parent will re-fetch and push updated propNodes / propEdges
+        onRefresh();
+        break;
+
+      default:
+        break;
+    }
+  }, [triggerFlash, onRefresh]);
+
+  // ---- Cytoscape.js integration -------------------------------------------
+  useEffect(() => {
+    if (engineMode !== "cytoscape" || !cyContainerRef.current) return;
+    let destroyed = false;
+
+    import("cytoscape")
+      .then((cytoscapeModule) => {
+        if (destroyed || !cyContainerRef.current) return;
+        const cytoscape = cytoscapeModule.default || cytoscapeModule;
+
+        const cyElements = [
+          ...liveNodes.map(n => ({
+            data: { id: n.id, name: n.name, criticality: n.criticality, status: n.status, ip: n.ip },
+          })),
+          ...liveEdges.map(e => ({
+            data: { id: e.id, source: e.source, target: e.target, relationship: e.relationship, protocol: e.protocol, status: e.status },
+          })),
+        ];
+
+        const cy = cytoscape({
+          container: cyContainerRef.current,
+          elements: cyElements,
+          style: [
+            {
+              selector: "node",
+              style: {
+                "background-color": "#0d1424",
+                label: "data(name)",
+                color: "#e2e8f0",
+                "font-size": "10px",
+                "font-family": "monospace",
+                "text-valign": "bottom",
+                "text-margin-y": 6,
+                "border-width": 2.5,
+                "border-color": "#3b82f6",
+                width: 38,
+                height: 38,
+              },
+            },
+            { selector: "node[status = 'COMPROMISED']", style: { "border-color": "#ef4444", "background-color": "#450a0a" } },
+            { selector: "node[criticality = 'CrownJewel']", style: { "border-color": "#a855f7", "background-color": "#3b0764", shape: "diamond" } },
+            { selector: "node[criticality = 'Honeypot'], node[status = 'DECOY']", style: { "border-color": "#f59e0b", "background-color": "#451a03", shape: "star" } },
+            { selector: "node[status = 'ISOLATED']", style: { "border-color": "#a855f7", "background-color": "#1e293b", "border-width": 3 } },
+            { selector: "edge", style: { width: 1.5, "line-color": "#00f3ff80", "target-arrow-color": "#00f3ff", "target-arrow-shape": "triangle", "curve-style": "bezier", label: "data(protocol)", "font-size": "8px", color: "#a5f3fc", "text-rotation": "autorotate" } },
+            { selector: "edge[status = 'DECEPTIVE']", style: { "line-color": "#f59e0b", "target-arrow-color": "#f59e0b", "line-style": "dashed" } },
+            { selector: "edge[status = 'QUARANTINED']", style: { "line-color": "#475569", "target-arrow-color": "#475569", "line-style": "dotted" } },
+          ],
+          layout: {
+            name: "cose",
+            idealEdgeLength: () => 100,
+            nodeOverlap: 20,
+            refresh: 20,
+            fit: true,
+            padding: 40,
+            randomize: false,
+            componentSpacing: 100,
+            nodeRepulsion: () => 400000,
+            edgeElasticity: () => 100,
+            nestingFactor: 5,
+            gravity: 80,
+            numIter: 1000,
+          },
+        });
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        cy.on("tap", "node", (evt: any) => onSelectNode(evt.target.id()));
+        cyInstanceRef.current = cy;
+      })
+      .catch(err => console.warn("Cytoscape module load warning, falling back to SVG renderer:", err));
+
+    return () => {
+      destroyed = true;
+      if (cyInstanceRef.current) {
+        cyInstanceRef.current.destroy();
+        cyInstanceRef.current = null;
+      }
+    };
+  }, [engineMode, liveNodes, liveEdges, onSelectNode]);
+
+  // ---- Drag / Pan handlers -------------------------------------------------
   const handleMouseDownNode = (e: React.MouseEvent, nodeId: string) => {
     e.stopPropagation();
     setDraggingNode(nodeId);
     const pos = positions[nodeId] || { x: 0, y: 0 };
-    setDragOffset({
-      x: e.clientX / zoom - pos.x,
-      y: e.clientY / zoom - pos.y
-    });
+    setDragOffset({ x: e.clientX / zoom - pos.x, y: e.clientY / zoom - pos.y });
     onSelectNode(nodeId);
   };
 
@@ -133,59 +421,61 @@ export default function GraphView({
       const newY = e.clientY / zoom - dragOffset.y;
       setPositions(prev => ({
         ...prev,
-        [draggingNode]: { x: Math.max(50, Math.min(1300, newX)), y: Math.max(50, Math.min(700, newY)) }
+        [draggingNode]: { x: Math.max(50, Math.min(1300, newX)), y: Math.max(50, Math.min(700, newY)) },
       }));
     } else if (isPanning) {
-      setPan({
-        x: e.clientX - panStart.x,
-        y: e.clientY - panStart.y
-      });
+      setPan({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
     }
   };
 
-  const handleMouseUp = () => {
-    setDraggingNode(null);
-    setIsPanning(false);
-  };
+  const handleMouseUp = () => { setDraggingNode(null); setIsPanning(false); };
 
-  const selectedNode = nodes.find(n => n.id === selectedNodeId);
+  // ---- Node styling helpers -----------------------------------------------
+  const selectedNode = liveNodes.find(n => n.id === selectedNodeId);
 
-  // Helper for node styling
   const getNodeColor = (node: GraphNode) => {
-    if (node.status === "ISOLATED") return "#64748b"; // Gray
-    if (node.status === "COMPROMISED") return "#ef4444"; // Pulsing Red
-    if (node.status === "DECOY_TRIGGERED" || node.status === "ALERTED") return "#f97316"; // Bright Orange
-    if (node.criticality === "Honeypot" || node.status === "DECOY") return "#f59e0b"; // Gold / Amber
-    if (node.criticality === "CrownJewel") return "#a855f7"; // Neon Purple
-    if (node.criticality === "Critical") return "#e11d48"; // Rose
-    if (node.label === "Gateway") return "#06b6d4"; // Cyan
-    return "#3b82f6"; // Blue
+    const flash = flashMap[node.id];
+    if (flash === "ATTACK") return "#facc15";       // Yellow — attack flash
+    if (flash === "CANARY") return "#ef4444";        // Red — canary breach
+    if (flash === "ISOLATED") return "#a855f7";      // Purple — isolation
+    if (node.status === "ISOLATED") return "#64748b";
+    if (node.status === "COMPROMISED") return "#ef4444";
+    if (node.status === "DECOY_TRIGGERED" || node.status === "ALERTED") return "#f97316";
+    if (node.criticality === "Honeypot" || node.status === "DECOY") return "#f59e0b";
+    if (node.criticality === "CrownJewel") return "#a855f7";
+    if (node.criticality === "Critical") return "#e11d48";
+    if (node.label === "Gateway") return "#06b6d4";
+    return "#3b82f6";
   };
 
   const getNodeIcon = (node: GraphNode) => {
-    if (node.status === "ISOLATED") return <Lock className="w-4 h-4 text-slate-300" />;
+    if (node.status === "ISOLATED") return <Lock className="w-4 h-4 text-purple-300" />;
     if (node.status === "COMPROMISED") return <ShieldAlert className="w-4 h-4 text-red-200 animate-pulse" />;
     if (node.criticality === "CrownJewel") return <Database className="w-4 h-4 text-purple-200" />;
     if (node.criticality === "Honeypot" || node.type === "canary" || node.type === "honeytoken") {
-      return <Sparkles className="w-4 h-4 text-amber-300 animate-spin" style={{ animationDuration: '6s' }} />;
+      return <Sparkles className="w-4 h-4 text-amber-300 animate-spin" style={{ animationDuration: "6s" }} />;
     }
     if (node.type === "workstation") return <Cpu className="w-4 h-4 text-cyan-200" />;
     return <Server className="w-4 h-4 text-blue-200" />;
   };
 
+  // ---- Crown jewel pulsing amber when at risk within 2 hops ---------------
+  const isCrownJewelAtRisk = (node: GraphNode) =>
+    node.criticality === "CrownJewel" && blastRadiusNodes.includes(node.id);
+
+  // =========================================================================
   return (
     <div className="relative w-full h-[620px] bg-[#070b16] border border-slate-800 rounded-xl overflow-hidden shadow-2xl flex flex-col">
+
       {/* Visualizer Top Toolbar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#0b1120] border-b border-slate-800/80 z-10 text-xs">
         <div className="flex items-center space-x-3">
           <div className="flex items-center space-x-2">
             <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-            <span className="font-semibold text-slate-200 tracking-wide uppercase">
-              Neo4j Real-Time GraphOps Topology
-            </span>
+            <span className="font-semibold text-slate-200 tracking-wide uppercase">Neo4j Real-Time GraphOps Topology</span>
           </div>
           <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
-            {nodes.length} Nodes • {edges.length} Relationships
+            {liveNodes.length} Nodes • {liveEdges.length} Relationships
           </span>
           {isSimulating && (
             <span className="flex items-center space-x-1.5 px-2 py-0.5 rounded bg-red-950/80 border border-red-500/50 text-red-400 font-mono animate-pulse">
@@ -193,31 +483,39 @@ export default function GraphView({
               <span>Simulated Attack Active</span>
             </span>
           )}
+          {/* Internal WS indicator */}
+          <span className={`flex items-center space-x-1 px-2 py-0.5 rounded font-mono ${wsLive ? "bg-emerald-950/60 text-emerald-400" : "bg-slate-800 text-slate-500"}`}>
+            <Zap className="w-3 h-3" />
+            <span>{wsLive ? "Live Mutations" : "Offline"}</span>
+          </span>
         </div>
 
-        {/* View Controls */}
         <div className="flex items-center space-x-2">
-          <button
-            onClick={() => setZoom(z => Math.min(1.4, z + 0.1))}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Zoom In"
-          >
-            <ZoomIn className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => setZoom(z => Math.max(0.4, z - 0.1))}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Zoom Out"
-          >
-            <ZoomOut className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => { setZoom(0.85); setPan({ x: 20, y: 30 }); }}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Reset Pan & Zoom"
-          >
-            <Maximize2 className="w-3.5 h-3.5" />
-          </button>
+          <div className="flex items-center bg-slate-900 border border-slate-700/80 rounded p-0.5 mr-1">
+            <button
+              onClick={() => setEngineMode("force")}
+              className={`flex items-center space-x-1 px-2 py-1 rounded text-[11px] font-medium transition ${engineMode === "force" ? "bg-cyan-600 text-black font-bold shadow" : "text-slate-400 hover:text-slate-200"}`}
+            >
+              <Layers className="w-3 h-3" />
+              <span>Force Graph</span>
+            </button>
+            <button
+              onClick={() => setEngineMode("cytoscape")}
+              className={`flex items-center space-x-1 px-2 py-1 rounded text-[11px] font-medium transition ${engineMode === "cytoscape" ? "bg-cyan-600 text-black font-bold shadow" : "text-slate-400 hover:text-slate-200"}`}
+            >
+              <Network className="w-3 h-3" />
+              <span>Cytoscape.js</span>
+            </button>
+          </div>
+
+          {engineMode === "force" && (
+            <>
+              <button onClick={() => setZoom(z => Math.min(1.4, z + 0.1))} className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition" title="Zoom In"><ZoomIn className="w-3.5 h-3.5" /></button>
+              <button onClick={() => setZoom(z => Math.max(0.4, z - 0.1))} className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition" title="Zoom Out"><ZoomOut className="w-3.5 h-3.5" /></button>
+              <button onClick={() => { setZoom(0.85); setPan({ x: 20, y: 30 }); }} className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition" title="Reset Pan & Zoom"><Maximize2 className="w-3.5 h-3.5" /></button>
+            </>
+          )}
+
           <button
             onClick={onRefresh}
             className="flex items-center space-x-1 px-2.5 py-1.5 bg-cyan-950/60 hover:bg-cyan-900 border border-cyan-500/40 text-cyan-300 rounded transition font-medium"
@@ -228,314 +526,278 @@ export default function GraphView({
         </div>
       </div>
 
-      {/* SVG Canvas */}
-      <div 
-        className="flex-1 relative cursor-grab active:cursor-grabbing select-none overflow-hidden"
+      {/* Main Graph Canvas */}
+      <div
+        className="flex-1 relative select-none overflow-hidden"
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
       >
-        <svg
-          ref={svgRef}
-          className="w-full h-full"
-          onMouseDown={handleMouseDownSvg}
-        >
-          <defs>
-            {/* Arrow Marker Definitions */}
-            <marker
-              id="arrow-active"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#00f3ff" />
-            </marker>
-            <marker
-              id="arrow-deceptive"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b" />
-            </marker>
-            <marker
-              id="arrow-quarantined"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" />
-            </marker>
-            <marker
-              id="arrow-compromised"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444" />
-            </marker>
-
-            {/* Glowing filter */}
-            <filter id="neon-glow" x="-20%" y="-20%" width="140%" height="140%">
-              <feGaussianBlur stdDeviation="3" result="blur" />
-              <feComposite in="SourceGraphic" in2="blur" operator="over" />
-            </filter>
-          </defs>
-
-          {/* Grid Background Pattern */}
-          <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-            <pattern id="graph-grid" width="40" height="40" patternUnits="userSpaceOnUse">
-              <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#131c31" strokeWidth="0.8" />
-            </pattern>
-            <rect x="-1000" y="-1000" width="4000" height="4000" fill="url(#graph-grid)" />
-
-            {/* Blast Radius Zone Highlights */}
-            {blastRadiusNodes.length > 0 && selectedNodeId && positions[selectedNodeId] && (
-              <g>
-                <circle
-                  cx={positions[selectedNodeId].x}
-                  cy={positions[selectedNodeId].y}
-                  r="190"
-                  fill="rgba(239, 68, 68, 0.05)"
-                  stroke="rgba(239, 68, 68, 0.3)"
-                  strokeWidth="1.5"
-                  strokeDasharray="6 4"
-                  className="animate-pulse"
-                />
-                <circle
-                  cx={positions[selectedNodeId].x}
-                  cy={positions[selectedNodeId].y}
-                  r="340"
-                  fill="rgba(239, 68, 68, 0.02)"
-                  stroke="rgba(239, 68, 68, 0.15)"
-                  strokeWidth="1"
-                  strokeDasharray="8 6"
-                />
-              </g>
-            )}
-
-            {/* Edges */}
-            {edges.map(edge => {
-              const srcPos = positions[edge.source];
-              const tgtPos = positions[edge.target];
-              if (!srcPos || !tgtPos) return null;
-
-              const isQuarantined = edge.status === "QUARANTINED";
-              const isDeceptive = edge.status === "DECEPTIVE";
-              const isBlastEdge = blastRadiusNodes.includes(edge.source) && blastRadiusNodes.includes(edge.target);
-              
-              let strokeColor = "#00f3ff80";
-              let marker = "url(#arrow-active)";
-              let dash = "none";
-
-              if (isQuarantined) {
-                strokeColor = "#475569";
-                marker = "url(#arrow-quarantined)";
-                dash = "4 4";
-              } else if (isDeceptive) {
-                strokeColor = "#f59e0b";
-                marker = "url(#arrow-deceptive)";
-                dash = "3 3";
-              } else if (isBlastEdge) {
-                strokeColor = "#ef4444";
-                marker = "url(#arrow-compromised)";
-              }
-
-              const midX = (srcPos.x + tgtPos.x) / 2;
-              const midY = (srcPos.y + tgtPos.y) / 2;
-
-              return (
-                <g key={edge.id} className="transition-all duration-300">
-                  <line
-                    x1={srcPos.x}
-                    y1={srcPos.y}
-                    x2={tgtPos.x}
-                    y2={tgtPos.y}
-                    stroke={strokeColor}
-                    strokeWidth={isBlastEdge ? 2.5 : (isDeceptive ? 1.8 : 1.5)}
-                    strokeDasharray={dash}
-                    markerEnd={marker}
-                  />
-                  {/* Relationship Label Pill */}
-                  <rect
-                    x={midX - 28}
-                    y={midY - 9}
-                    width="56"
-                    height="18"
-                    rx="4"
-                    fill="#080e1c"
-                    stroke={strokeColor}
-                    strokeWidth="0.8"
-                    opacity="0.9"
-                  />
-                  <text
-                    x={midX}
-                    y={midY + 3.5}
-                    textAnchor="middle"
-                    fill={isQuarantined ? "#94a3b8" : (isDeceptive ? "#fbbf24" : "#a5f3fc")}
-                    fontSize="9"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {edge.protocol || edge.relationship}
-                  </text>
-                </g>
-              );
-            })}
-
-            {/* Nodes */}
-            {nodes.map(node => {
-              const pos = positions[node.id] || { x: 200, y: 200 };
-              const isSelected = node.id === selectedNodeId;
-              const isInBlastRadius = blastRadiusNodes.includes(node.id);
-              const nodeColor = getNodeColor(node);
-              const isHoneypot = node.criticality === "Honeypot" || node.status === "DECOY";
-
-              return (
-                <g
-                  key={node.id}
-                  transform={`translate(${pos.x}, ${pos.y})`}
-                  className="cursor-pointer transition-transform duration-150"
-                  onMouseDown={(e) => handleMouseDownNode(e, node.id)}
+        {engineMode === "cytoscape" ? (
+          <div ref={cyContainerRef} className="w-full h-full bg-[#050913]" />
+        ) : (
+          <svg
+            ref={svgRef}
+            className="w-full h-full cursor-grab active:cursor-grabbing"
+            onMouseDown={handleMouseDownSvg}
+          >
+            <defs>
+              {/* Arrow markers */}
+              {(["active", "deceptive", "quarantined", "compromised"] as const).map(kind => (
+                <marker
+                  key={kind}
+                  id={`arrow-${kind}`}
+                  viewBox="0 0 10 10"
+                  refX="22"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
                 >
-                  {/* Selected / Compromised Glow Ring */}
-                  {(isSelected || node.status === "COMPROMISED" || isInBlastRadius) && (
-                    <circle
-                      r="32"
-                      fill="none"
-                      stroke={node.status === "COMPROMISED" ? "#ef4444" : (isSelected ? "#00f3ff" : "#f97316")}
-                      strokeWidth={isSelected ? "3" : "2"}
-                      strokeDasharray={node.status === "COMPROMISED" ? "4 3" : "none"}
-                      className={node.status === "COMPROMISED" ? "animate-pulse" : ""}
-                    />
-                  )}
+                  <path
+                    d="M 0 0 L 10 5 L 0 10 z"
+                    fill={kind === "active" ? "#00f3ff" : kind === "deceptive" ? "#f59e0b" : kind === "compromised" ? "#ef4444" : "#64748b"}
+                  />
+                </marker>
+              ))}
 
-                  {/* Honeypot Golden Pulsing Aura */}
-                  {isHoneypot && (
-                    <circle
-                      r="28"
-                      fill="none"
-                      stroke="#f59e0b"
-                      strokeWidth="1.5"
-                      strokeDasharray="2 2"
-                      opacity="0.6"
-                      className="animate-spin"
-                      style={{ animationDuration: '8s' }}
-                    />
-                  )}
+              {/* Neon glow filter */}
+              <filter id="neon-glow" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3" result="blur" />
+                <feComposite in="SourceGraphic" in2="blur" operator="over" />
+              </filter>
 
-                  {/* Main Node Background Card / Circle */}
+              {/* Flash-yellow filter */}
+              <filter id="flash-attack" x="-30%" y="-30%" width="160%" height="160%">
+                <feFlood floodColor="#facc15" floodOpacity="0.5" result="color" />
+                <feComposite in="color" in2="SourceGraphic" operator="in" result="tinted" />
+                <feMerge><feMergeNode in="tinted" /><feMergeNode in="SourceGraphic" /></feMerge>
+              </filter>
+
+              {/* Flash-red filter */}
+              <filter id="flash-canary" x="-30%" y="-30%" width="160%" height="160%">
+                <feGaussianBlur stdDeviation="6" result="blur" />
+                <feFlood floodColor="#ef4444" floodOpacity="0.7" result="color" />
+                <feComposite in="color" in2="blur" operator="in" result="glow" />
+                <feMerge><feMergeNode in="glow" /><feMergeNode in="SourceGraphic" /></feMerge>
+              </filter>
+            </defs>
+
+            <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
+              {/* Grid */}
+              <pattern id="graph-grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#131c31" strokeWidth="0.8" />
+              </pattern>
+              <rect x="-1000" y="-1000" width="4000" height="4000" fill="url(#graph-grid)" />
+
+              {/* Blast radius rings */}
+              {blastRadiusNodes.length > 0 && selectedNodeId && positions[selectedNodeId] && (
+                <g>
                   <circle
-                    r="22"
-                    fill="#0d1424"
-                    stroke={nodeColor}
-                    strokeWidth="2.5"
-                    filter="url(#neon-glow)"
+                    cx={positions[selectedNodeId].x}
+                    cy={positions[selectedNodeId].y}
+                    r="190"
+                    fill="rgba(239,68,68,0.05)"
+                    stroke="rgba(239,68,68,0.3)"
+                    strokeWidth="1.5"
+                    strokeDasharray="6 4"
+                    className="animate-pulse"
                   />
-
-                  {/* Node Center Icon */}
-                  <foreignObject x="-12" y="-12" width="24" height="24" className="pointer-events-none">
-                    <div className="w-full h-full flex items-center justify-center">
-                      {getNodeIcon(node)}
-                    </div>
-                  </foreignObject>
-
-                  {/* Status Indicator Pill below node */}
-                  <rect
-                    x="-45"
-                    y="27"
-                    width="90"
-                    height="18"
-                    rx="4"
-                    fill="#080e1c"
-                    stroke={nodeColor}
+                  <circle
+                    cx={positions[selectedNodeId].x}
+                    cy={positions[selectedNodeId].y}
+                    r="340"
+                    fill="rgba(239,68,68,0.02)"
+                    stroke="rgba(239,68,68,0.15)"
                     strokeWidth="1"
+                    strokeDasharray="8 6"
                   />
-                  <text
-                    x="0"
-                    y="40"
-                    textAnchor="middle"
-                    fill="#e2e8f0"
-                    fontSize="9.5"
-                    fontWeight="600"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {node.name.length > 14 ? node.name.substring(0, 13) + '…' : node.name}
-                  </text>
-
-                  {/* Node IP Sub-tag */}
-                  <text
-                    x="0"
-                    y="55"
-                    textAnchor="middle"
-                    fill="#64748b"
-                    fontSize="8.5"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {node.ip}
-                  </text>
                 </g>
-              );
-            })}
-          </g>
-        </svg>
+              )}
 
-        {/* Selected Node Inspector Drawer / Popover */}
+              {/* Edges */}
+              {liveEdges.map(edge => {
+                const srcPos = positions[edge.source];
+                const tgtPos = positions[edge.target];
+                if (!srcPos || !tgtPos) return null;
+
+                const isQuarantined = edge.status === "QUARANTINED";
+                const isDeceptive = edge.status === "DECEPTIVE";
+                const isBlastEdge =
+                  blastRadiusNodes.includes(edge.source) &&
+                  blastRadiusNodes.includes(edge.target);
+
+                let strokeColor = "#00f3ff80";
+                let marker = "url(#arrow-active)";
+                let dash = "none";
+
+                if (isQuarantined) {
+                  strokeColor = "#47556933";
+                  marker = "url(#arrow-quarantined)";
+                  dash = "4 6";
+                } else if (isDeceptive) {
+                  strokeColor = "#f59e0b";
+                  marker = "url(#arrow-deceptive)";
+                  dash = "3 3";
+                } else if (isBlastEdge) {
+                  strokeColor = "#ef4444";
+                  marker = "url(#arrow-compromised)";
+                }
+
+                const midX = (srcPos.x + tgtPos.x) / 2;
+                const midY = (srcPos.y + tgtPos.y) / 2;
+
+                return (
+                  <g key={edge.id} className="transition-all duration-500">
+                    <line
+                      x1={srcPos.x} y1={srcPos.y}
+                      x2={tgtPos.x} y2={tgtPos.y}
+                      stroke={strokeColor}
+                      strokeWidth={isBlastEdge ? 2.5 : isDeceptive ? 1.8 : 1.5}
+                      strokeDasharray={dash}
+                      markerEnd={isQuarantined ? undefined : marker}
+                      opacity={isQuarantined ? 0.25 : 1}
+                    />
+                    {/* Severed indicator on quarantined edges */}
+                    {isQuarantined && (
+                      <text
+                        x={midX}
+                        y={midY}
+                        textAnchor="middle"
+                        fill="#94a3b8"
+                        fontSize="10"
+                        fontFamily="monospace"
+                        className="select-none pointer-events-none"
+                      >✂</text>
+                    )}
+                    {!isQuarantined && (
+                      <>
+                        <rect x={midX - 28} y={midY - 9} width="56" height="18" rx="4" fill="#080e1c" stroke={strokeColor} strokeWidth="0.8" opacity="0.9" />
+                        <text x={midX} y={midY + 3.5} textAnchor="middle" fill={isDeceptive ? "#fbbf24" : "#a5f3fc"} fontSize="9" fontFamily="monospace" className="select-none pointer-events-none">
+                          {edge.protocol || edge.relationship}
+                        </text>
+                      </>
+                    )}
+                  </g>
+                );
+              })}
+
+              {/* Nodes */}
+              {liveNodes.map(node => {
+                const pos = positions[node.id] || { x: 200, y: 200 };
+                const isSelected = node.id === selectedNodeId;
+                const isInBlastRadius = blastRadiusNodes.includes(node.id);
+                const nodeColor = getNodeColor(node);
+                const isHoneypot = node.criticality === "Honeypot" || node.status === "DECOY";
+                const flash = flashMap[node.id];
+                const crownAtRisk = isCrownJewelAtRisk(node);
+
+                return (
+                  <g
+                    key={node.id}
+                    transform={`translate(${pos.x}, ${pos.y})`}
+                    className="cursor-pointer"
+                    style={{ transition: "transform 0.3s ease" }}
+                    onMouseDown={(e) => handleMouseDownNode(e, node.id)}
+                  >
+                    {/* Flash aura (attack = yellow, canary = red glow, isolated = purple) */}
+                    {flash && (
+                      <circle
+                        r="38"
+                        fill={
+                          flash === "ATTACK" ? "rgba(250,204,21,0.25)" :
+                          flash === "CANARY" ? "rgba(239,68,68,0.3)" :
+                          "rgba(168,85,247,0.2)"
+                        }
+                        className="animate-ping"
+                        style={{ animationDuration: "0.7s" }}
+                      />
+                    )}
+
+                    {/* Crown jewel amber pulse when at risk */}
+                    {crownAtRisk && !flash && (
+                      <circle r="36" fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="3 2" className="animate-pulse" />
+                    )}
+
+                    {/* Outer ring for selected / status */}
+                    {(isSelected || node.status === "COMPROMISED" || node.status === "ISOLATED" || isInBlastRadius) && (
+                      <circle
+                        r="32"
+                        fill="none"
+                        stroke={
+                          node.status === "COMPROMISED" ? "#ef4444" :
+                          node.status === "ISOLATED" ? "#94a3b8" :
+                          isSelected ? "#00f3ff" : "#f97316"
+                        }
+                        strokeWidth={node.status === "ISOLATED" ? "2.5" : isSelected ? "3" : "2"}
+                        strokeDasharray={
+                          node.status === "COMPROMISED" ? "4 3" :
+                          node.status === "ISOLATED" ? "3 3" : "none"
+                        }
+                        className={node.status === "COMPROMISED" ? "animate-pulse" : ""}
+                        style={node.status === "ISOLATED" ? { filter: "drop-shadow(0 0 8px #a855f7)" } : undefined}
+                      />
+                    )}
+
+                    {/* Honeypot spinning ring */}
+                    {isHoneypot && (
+                      <circle r="28" fill="none" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="2 2" opacity="0.6" className="animate-spin" style={{ animationDuration: "8s" }} />
+                    )}
+
+                    {/* Node body */}
+                    <circle r="22" fill="#0d1424" stroke={nodeColor} strokeWidth="2.5" filter="url(#neon-glow)" />
+
+                    {/* Icon */}
+                    <foreignObject x="-12" y="-12" width="24" height="24" className="pointer-events-none">
+                      <div className="w-full h-full flex items-center justify-center">
+                        {getNodeIcon(node)}
+                      </div>
+                    </foreignObject>
+
+                    {/* Name label */}
+                    <rect x="-45" y="27" width="90" height="18" rx="4" fill="#080e1c" stroke={nodeColor} strokeWidth="1" />
+                    <text x="0" y="40" textAnchor="middle" fill="#e2e8f0" fontSize="9.5" fontWeight="600" fontFamily="monospace" className="select-none pointer-events-none">
+                      {node.name.length > 14 ? node.name.substring(0, 13) + "…" : node.name}
+                    </text>
+
+                    {/* IP */}
+                    <text x="0" y="55" textAnchor="middle" fill="#64748b" fontSize="8.5" fontFamily="monospace" className="select-none pointer-events-none">
+                      {node.ip}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        )}
+
+        {/* Selected Node Detail Drawer */}
         {selectedNode && (
           <div className="absolute bottom-4 right-4 w-84 bg-[#0d1322]/95 border border-cyan-500/40 rounded-lg p-3.5 shadow-2xl backdrop-blur-md z-20 text-xs">
             <div className="flex items-center justify-between border-b border-slate-700/80 pb-2 mb-2.5">
               <div className="flex items-center space-x-2">
-                <span 
-                  className="w-2.5 h-2.5 rounded-full" 
-                  style={{ backgroundColor: getNodeColor(selectedNode) }}
-                />
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: getNodeColor(selectedNode) }} />
                 <span className="font-bold text-slate-100">{selectedNode.name}</span>
               </div>
               <span className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-semibold ${
-                selectedNode.status === 'COMPROMISED' ? 'bg-red-950 text-red-400 border border-red-700' :
-                selectedNode.status === 'ISOLATED' ? 'bg-slate-800 text-slate-300' :
-                selectedNode.status === 'DECOY' ? 'bg-amber-950 text-amber-300 border border-amber-600' :
-                'bg-emerald-950 text-emerald-300 border border-emerald-700'
+                selectedNode.status === "COMPROMISED" ? "bg-red-950 text-red-400 border border-red-700" :
+                selectedNode.status === "ISOLATED" ? "bg-slate-800 text-slate-300" :
+                selectedNode.status === "DECOY" ? "bg-amber-950 text-amber-300 border border-amber-600" :
+                "bg-emerald-950 text-emerald-300 border border-emerald-700"
               }`}>
                 {selectedNode.status}
               </span>
             </div>
 
             <div className="space-y-1.5 font-mono text-slate-300 text-[11px]">
-              <div className="flex justify-between">
-                <span className="text-slate-500">ID:</span>
-                <span className="text-slate-200">{selectedNode.id}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Type / OS:</span>
-                <span className="text-slate-200">{selectedNode.type} / {selectedNode.os}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">IP Address:</span>
-                <span className="text-cyan-400">{selectedNode.ip}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Criticality:</span>
-                <span className="text-purple-300 font-semibold">{selectedNode.criticality}</span>
-              </div>
+              <div className="flex justify-between"><span className="text-slate-500">ID:</span><span className="text-slate-200">{selectedNode.id}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Type / OS:</span><span className="text-slate-200">{selectedNode.type} / {selectedNode.os}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">IP Address:</span><span className="text-cyan-400">{selectedNode.ip}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Criticality:</span><span className="text-purple-300 font-semibold">{selectedNode.criticality}</span></div>
               {selectedNode.cve && (
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Vulnerability:</span>
-                  <span className="text-red-400">{selectedNode.cve}</span>
-                </div>
+                <div className="flex justify-between"><span className="text-slate-500">CVE:</span><span className="text-red-400">{selectedNode.cve}</span></div>
+              )}
+              {selectedNode.last_alert && (
+                <div className="flex justify-between"><span className="text-slate-500">Alert:</span><span className="text-amber-300 truncate max-w-[140px]">{selectedNode.last_alert}</span></div>
               )}
             </div>
 
@@ -543,7 +805,6 @@ export default function GraphView({
               {selectedNode.description || "Active asset modeled in Neo4j Knowledge Graph."}
             </p>
 
-            {/* Micro-segmentation / Containment Quick Action */}
             <div className="mt-3 flex space-x-2">
               {selectedNode.status !== "ISOLATED" ? (
                 <button
@@ -563,36 +824,20 @@ export default function GraphView({
         )}
       </div>
 
-      {/* Visualizer Footer Legend */}
+      {/* Footer Legend */}
       <div className="px-4 py-2 bg-[#090e1c] border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
         <div className="flex items-center space-x-4">
-          <div className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#00f3ff]" />
-            <span>Perimeter / Network</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]" />
-            <span>Compromised Ingress</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_#f59e0b]" />
-            <span>AI Deception Honeypot</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-purple-500 shadow-[0_0_8px_#a855f7]" />
-            <span>Crown Jewel DB</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-500" />
-            <span>Isolated Asset</span>
-          </div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#00f3ff]" /><span>Perimeter</span></div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]" /><span>Compromised</span></div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-yellow-400 shadow-[0_0_8px_#facc15]" /><span>Attack Flash</span></div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_#f59e0b]" /><span>Honeypot</span></div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-purple-500 shadow-[0_0_8px_#a855f7]" /><span>Crown Jewel</span></div>
+          <div className="flex items-center space-x-1.5"><span className="w-2.5 h-2.5 rounded-full bg-slate-500" /><span>Isolated</span></div>
         </div>
-
         <span className="text-slate-500 font-mono">
-          Interactive Drag & Zoom • Click node for GraphOps actions
+          {engineMode === "force" ? "Interactive Force Graph Mode" : "Cytoscape.js Physics Layout Mode"}
         </span>
       </div>
     </div>
   );
 }
-

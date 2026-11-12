@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect } from "react";
-import { Terminal, Send, ShieldAlert, Sparkles, Play, Trash2 } from "lucide-react";
+import { Terminal, Send, ShieldAlert, Sparkles, Play, Trash2, HelpCircle } from "lucide-react";
 
 interface MitreInfo {
   technique_id: string;
@@ -62,13 +62,10 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputCmd.trim() || isExecuting) return;
-
-    const cmd = inputCmd.trim();
-    setInputCmd("");
+  const executeCommandInternal = async (cmd: string) => {
+    if (!cmd.trim() || isExecuting) return;
     setIsExecuting(true);
+    setInputCmd(cmd);
 
     const now = new Date().toLocaleTimeString();
 
@@ -79,9 +76,9 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
         {
           id: Math.random().toString(),
           command: cmd,
-          output: res.output,
-          mitre: res.mitre_technique,
-          alert: res.alert_details,
+          output: res?.output || `[Command executed: ${cmd}]`,
+          mitre: res?.mitre_technique,
+          alert: res?.alert_details,
           timestamp: now
         }
       ]);
@@ -100,8 +97,18 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
     }
   };
 
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputCmd.trim() || isExecuting) return;
+
+    const cmd = inputCmd.trim();
+    setInputCmd("");
+    await executeCommandInternal(cmd);
+  };
+
   const handleRunPreset = (cmd: string) => {
     setInputCmd(cmd);
+    executeCommandInternal(cmd);
   };
 
   const clearTerminal = () => {
@@ -110,6 +117,7 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
 
   return (
     <div className="w-full h-[620px] bg-[#060a14] border border-slate-800 rounded-xl overflow-hidden shadow-2xl flex flex-col font-mono">
+      {/* Terminal Title Bar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#0b1222] border-b border-slate-800 text-xs">
         <div className="flex items-center space-x-2">
           <div className="flex space-x-1.5">
@@ -137,6 +145,7 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
         </div>
       </div>
 
+      {/* Preset Demo Attack Triggers */}
       <div className="px-3 py-2 bg-[#090e1c] border-b border-slate-800/80 flex flex-wrap items-center gap-1.5 text-[11px]">
         <span className="text-slate-500 font-sans font-medium flex items-center space-x-1 mr-1">
           <Play className="w-3 h-3 text-cyan-400" />
@@ -175,9 +184,11 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
         </button>
       </div>
 
+      {/* Terminal Output Stream */}
       <div className="flex-1 p-4 overflow-y-auto space-y-4 text-xs leading-relaxed terminal-scanlines">
         {logs.map((log) => (
           <div key={log.id} className="space-y-1.5">
+            {/* Command Header with MITRE ATT&CK Tag */}
             <div className="flex flex-wrap items-center justify-between text-slate-400 border-b border-slate-800/40 pb-1">
               <div className="flex items-center space-x-2">
                 <span className="text-emerald-400 font-bold">www-data@dmz-web-prod:~$</span>
@@ -197,6 +208,7 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
               </div>
             </div>
 
+            {/* Alert Notification Pill if Deception was Triggered */}
             {log.alert && (
               <div className="p-2 bg-red-950/80 border border-red-600/60 rounded text-red-300 text-[11px] flex items-start space-x-2 animate-pulse">
                 <ShieldAlert className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
@@ -206,6 +218,7 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
               </div>
             )}
 
+            {/* Emulated Shell Output */}
             <pre className="text-slate-300 whitespace-pre-wrap font-mono pl-2 text-[11.5px] border-l-2 border-slate-700/60">
               {log.output}
             </pre>
@@ -214,6 +227,7 @@ export default function ShellView({ onExecuteCommand }: ShellViewProps) {
         <div ref={terminalEndRef} />
       </div>
 
+      {/* Terminal Input Bar */}
       <form onSubmit={handleSubmit} className="p-3 bg-[#0a0f1d] border-t border-slate-800 flex items-center space-x-2">
         <span className="text-emerald-400 font-bold text-xs select-none">www-data@dmz-web-prod:~$</span>
         <input

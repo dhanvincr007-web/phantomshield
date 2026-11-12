@@ -13,7 +13,9 @@ import {
   Activity,
   Maximize2,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Layers,
+  Network
 } from "lucide-react";
 
 export interface GraphNode {
@@ -81,6 +83,7 @@ export default function GraphView({
   onRefresh,
   isSimulating
 }: GraphViewProps) {
+  const [engineMode, setEngineMode] = useState<"force" | "cytoscape">("force");
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(DEFAULT_NODE_POSITIONS);
   const [draggingNode, setDraggingNode] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
@@ -88,7 +91,11 @@ export default function GraphView({
   const [pan, setPan] = useState({ x: 20, y: 30 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const cyContainerRef = useRef<HTMLDivElement | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cyInstanceRef = useRef<any>(null);
 
   useEffect(() => {
     setPositions(prev => {
@@ -103,6 +110,160 @@ export default function GraphView({
       return updated;
     });
   }, [nodes]);
+
+  // Cytoscape.js Integration
+  useEffect(() => {
+    if (engineMode !== "cytoscape" || !cyContainerRef.current) return;
+
+    let destroyed = false;
+
+    import("cytoscape")
+      .then((cytoscapeModule) => {
+        if (destroyed || !cyContainerRef.current) return;
+        const cytoscape = cytoscapeModule.default || cytoscapeModule;
+
+        const cyElements = [
+          ...nodes.map(n => ({
+            data: {
+              id: n.id,
+              name: n.name,
+              criticality: n.criticality,
+              status: n.status,
+              ip: n.ip
+            }
+          })),
+          ...edges.map(e => ({
+            data: {
+              id: e.id,
+              source: e.source,
+              target: e.target,
+              relationship: e.relationship,
+              protocol: e.protocol,
+              status: e.status
+            }
+          }))
+        ];
+
+        const cy = cytoscape({
+          container: cyContainerRef.current,
+          elements: cyElements,
+          style: [
+            {
+              selector: "node",
+              style: {
+                "background-color": "#0d1424",
+                "label": "data(name)",
+                "color": "#e2e8f0",
+                "font-size": "10px",
+                "font-family": "monospace",
+                "text-valign": "bottom",
+                "text-margin-y": 6,
+                "border-width": 2.5,
+                "border-color": "#3b82f6",
+                "width": 38,
+                "height": 38
+              }
+            },
+            {
+              selector: "node[status = 'COMPROMISED']",
+              style: {
+                "border-color": "#ef4444",
+                "background-color": "#450a0a"
+              }
+            },
+            {
+              selector: "node[criticality = 'CrownJewel']",
+              style: {
+                "border-color": "#a855f7",
+                "background-color": "#3b0764",
+                "shape": "diamond"
+              }
+            },
+            {
+              selector: "node[criticality = 'Honeypot'], node[status = 'DECOY']",
+              style: {
+                "border-color": "#f59e0b",
+                "background-color": "#451a03",
+                "shape": "star"
+              }
+            },
+            {
+              selector: "node[status = 'ISOLATED']",
+              style: {
+                "border-color": "#a855f7",
+                "background-color": "#1e293b",
+                "border-width": 3,
+                "line-style": "dashed"
+              }
+            },
+            {
+              selector: "edge",
+              style: {
+                "width": 1.5,
+                "line-color": "#00f3ff80",
+                "target-arrow-color": "#00f3ff",
+                "target-arrow-shape": "triangle",
+                "curve-style": "bezier",
+                "label": "data(protocol)",
+                "font-size": "8px",
+                "color": "#a5f3fc",
+                "text-rotation": "autorotate"
+              }
+            },
+            {
+              selector: "edge[status = 'DECEPTIVE']",
+              style: {
+                "line-color": "#f59e0b",
+                "target-arrow-color": "#f59e0b",
+                "line-style": "dashed"
+              }
+            },
+            {
+              selector: "edge[status = 'QUARANTINED']",
+              style: {
+                "line-color": "#475569",
+                "target-arrow-color": "#475569",
+                "line-style": "dotted"
+              }
+            }
+          ],
+          layout: {
+            name: "cose",
+            idealEdgeLength: () => 100,
+            nodeOverlap: 20,
+            refresh: 20,
+            fit: true,
+            padding: 40,
+            randomize: false,
+            componentSpacing: 100,
+            nodeRepulsion: () => 400000,
+            edgeElasticity: () => 100,
+            nestingFactor: 5,
+            gravity: 80,
+            numIter: 1000
+          }
+        });
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        cy.on("tap", "node", (evt: any) => {
+          const node = evt.target;
+          onSelectNode(node.id());
+        });
+
+        cyInstanceRef.current = cy;
+      })
+      .catch((err) => {
+        console.warn("Cytoscape module load warning, falling back to SVG renderer:", err);
+      });
+
+    return () => {
+      destroyed = true;
+      if (cyInstanceRef.current) {
+        cyInstanceRef.current.destroy();
+        cyInstanceRef.current = null;
+      }
+    };
+  }, [engineMode, nodes, edges, onSelectNode]);
 
   const handleMouseDownNode = (e: React.MouseEvent, nodeId: string) => {
     e.stopPropagation();
@@ -157,7 +318,7 @@ export default function GraphView({
   };
 
   const getNodeIcon = (node: GraphNode) => {
-    if (node.status === "ISOLATED") return <Lock className="w-4 h-4 text-slate-300" />;
+    if (node.status === "ISOLATED") return <Lock className="w-4 h-4 text-purple-300" />;
     if (node.status === "COMPROMISED") return <ShieldAlert className="w-4 h-4 text-red-200 animate-pulse" />;
     if (node.criticality === "CrownJewel") return <Database className="w-4 h-4 text-purple-200" />;
     if (node.criticality === "Honeypot" || node.type === "canary" || node.type === "honeytoken") {
@@ -169,6 +330,7 @@ export default function GraphView({
 
   return (
     <div className="relative w-full h-[620px] bg-[#070b16] border border-slate-800 rounded-xl overflow-hidden shadow-2xl flex flex-col">
+      {/* Visualizer Top Toolbar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#0b1120] border-b border-slate-800/80 z-10 text-xs">
         <div className="flex items-center space-x-3">
           <div className="flex items-center space-x-2">
@@ -188,28 +350,60 @@ export default function GraphView({
           )}
         </div>
 
+        {/* Engine Switcher & View Controls */}
         <div className="flex items-center space-x-2">
-          <button
-            onClick={() => setZoom(z => Math.min(1.4, z + 0.1))}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Zoom In"
-          >
-            <ZoomIn className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => setZoom(z => Math.max(0.4, z - 0.1))}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Zoom Out"
-          >
-            <ZoomOut className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => { setZoom(0.85); setPan({ x: 20, y: 30 }); }}
-            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-            title="Reset Pan & Zoom"
-          >
-            <Maximize2 className="w-3.5 h-3.5" />
-          </button>
+          {/* Engine Selector */}
+          <div className="flex items-center bg-slate-900 border border-slate-700/80 rounded p-0.5 mr-1">
+            <button
+              onClick={() => setEngineMode("force")}
+              className={`flex items-center space-x-1 px-2 py-1 rounded text-[11px] font-medium transition ${
+                engineMode === "force" 
+                  ? "bg-cyan-600 text-black font-bold shadow" 
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Layers className="w-3 h-3" />
+              <span>Force Graph</span>
+            </button>
+            <button
+              onClick={() => setEngineMode("cytoscape")}
+              className={`flex items-center space-x-1 px-2 py-1 rounded text-[11px] font-medium transition ${
+                engineMode === "cytoscape" 
+                  ? "bg-cyan-600 text-black font-bold shadow" 
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Network className="w-3 h-3" />
+              <span>Cytoscape.js</span>
+            </button>
+          </div>
+
+          {engineMode === "force" && (
+            <>
+              <button
+                onClick={() => setZoom(z => Math.min(1.4, z + 0.1))}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
+                title="Zoom In"
+              >
+                <ZoomIn className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => setZoom(z => Math.max(0.4, z - 0.1))}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
+                title="Zoom Out"
+              >
+                <ZoomOut className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => { setZoom(0.85); setPan({ x: 20, y: 30 }); }}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
+                title="Reset Pan & Zoom"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+            </>
+          )}
+
           <button
             onClick={onRefresh}
             className="flex items-center space-x-1 px-2.5 py-1.5 bg-cyan-950/60 hover:bg-cyan-900 border border-cyan-500/40 text-cyan-300 rounded transition font-medium"
@@ -220,257 +414,271 @@ export default function GraphView({
         </div>
       </div>
 
+      {/* Main Graph Canvas */}
       <div 
-        className="flex-1 relative cursor-grab active:cursor-grabbing select-none overflow-hidden"
+        className="flex-1 relative select-none overflow-hidden"
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
       >
-        <svg
-          ref={svgRef}
-          className="w-full h-full"
-          onMouseDown={handleMouseDownSvg}
-        >
-          <defs>
-            <marker
-              id="arrow-active"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#00f3ff" />
-            </marker>
-            <marker
-              id="arrow-deceptive"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b" />
-            </marker>
-            <marker
-              id="arrow-quarantined"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" />
-            </marker>
-            <marker
-              id="arrow-compromised"
-              viewBox="0 0 10 10"
-              refX="22"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444" />
-            </marker>
+        {engineMode === "cytoscape" ? (
+          <div ref={cyContainerRef} className="w-full h-full bg-[#050913]" />
+        ) : (
+          <svg
+            ref={svgRef}
+            className="w-full h-full cursor-grab active:cursor-grabbing"
+            onMouseDown={handleMouseDownSvg}
+          >
+            <defs>
+              <marker
+                id="arrow-active"
+                viewBox="0 0 10 10"
+                refX="22"
+                refY="5"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#00f3ff" />
+              </marker>
+              <marker
+                id="arrow-deceptive"
+                viewBox="0 0 10 10"
+                refX="22"
+                refY="5"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b" />
+              </marker>
+              <marker
+                id="arrow-quarantined"
+                viewBox="0 0 10 10"
+                refX="22"
+                refY="5"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" />
+              </marker>
+              <marker
+                id="arrow-compromised"
+                viewBox="0 0 10 10"
+                refX="22"
+                refY="5"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444" />
+              </marker>
 
-            <filter id="neon-glow" x="-20%" y="-20%" width="140%" height="140%">
-              <feGaussianBlur stdDeviation="3" result="blur" />
-              <feComposite in="SourceGraphic" in2="blur" operator="over" />
-            </filter>
-          </defs>
+              <filter id="neon-glow" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3" result="blur" />
+                <feComposite in="SourceGraphic" in2="blur" operator="over" />
+              </filter>
+            </defs>
 
-          <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-            <pattern id="graph-grid" width="40" height="40" patternUnits="userSpaceOnUse">
-              <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#131c31" strokeWidth="0.8" />
-            </pattern>
-            <rect x="-1000" y="-1000" width="4000" height="4000" fill="url(#graph-grid)" />
+            <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
+              <pattern id="graph-grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#131c31" strokeWidth="0.8" />
+              </pattern>
+              <rect x="-1000" y="-1000" width="4000" height="4000" fill="url(#graph-grid)" />
 
-            {blastRadiusNodes.length > 0 && selectedNodeId && positions[selectedNodeId] && (
-              <g>
-                <circle
-                  cx={positions[selectedNodeId].x}
-                  cy={positions[selectedNodeId].y}
-                  r="190"
-                  fill="rgba(239, 68, 68, 0.05)"
-                  stroke="rgba(239, 68, 68, 0.3)"
-                  strokeWidth="1.5"
-                  strokeDasharray="6 4"
-                  className="animate-pulse"
-                />
-                <circle
-                  cx={positions[selectedNodeId].x}
-                  cy={positions[selectedNodeId].y}
-                  r="340"
-                  fill="rgba(239, 68, 68, 0.02)"
-                  stroke="rgba(239, 68, 68, 0.15)"
-                  strokeWidth="1"
-                  strokeDasharray="8 6"
-                />
-              </g>
-            )}
-
-            {edges.map(edge => {
-              const srcPos = positions[edge.source];
-              const tgtPos = positions[edge.target];
-              if (!srcPos || !tgtPos) return null;
-
-              const isQuarantined = edge.status === "QUARANTINED";
-              const isDeceptive = edge.status === "DECEPTIVE";
-              const isBlastEdge = blastRadiusNodes.includes(edge.source) && blastRadiusNodes.includes(edge.target);
-              
-              let strokeColor = "#00f3ff80";
-              let marker = "url(#arrow-active)";
-              let dash = "none";
-
-              if (isQuarantined) {
-                strokeColor = "#475569";
-                marker = "url(#arrow-quarantined)";
-                dash = "4 4";
-              } else if (isDeceptive) {
-                strokeColor = "#f59e0b";
-                marker = "url(#arrow-deceptive)";
-                dash = "3 3";
-              } else if (isBlastEdge) {
-                strokeColor = "#ef4444";
-                marker = "url(#arrow-compromised)";
-              }
-
-              const midX = (srcPos.x + tgtPos.x) / 2;
-              const midY = (srcPos.y + tgtPos.y) / 2;
-
-              return (
-                <g key={edge.id} className="transition-all duration-300">
-                  <line
-                    x1={srcPos.x}
-                    y1={srcPos.y}
-                    x2={tgtPos.x}
-                    y2={tgtPos.y}
-                    stroke={strokeColor}
-                    strokeWidth={isBlastEdge ? 2.5 : (isDeceptive ? 1.8 : 1.5)}
-                    strokeDasharray={dash}
-                    markerEnd={marker}
-                  />
-                  <rect
-                    x={midX - 28}
-                    y={midY - 9}
-                    width="56"
-                    height="18"
-                    rx="4"
-                    fill="#080e1c"
-                    stroke={strokeColor}
-                    strokeWidth="0.8"
-                    opacity="0.9"
-                  />
-                  <text
-                    x={midX}
-                    y={midY + 3.5}
-                    textAnchor="middle"
-                    fill={isQuarantined ? "#94a3b8" : (isDeceptive ? "#fbbf24" : "#a5f3fc")}
-                    fontSize="9"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {edge.protocol || edge.relationship}
-                  </text>
-                </g>
-              );
-            })}
-
-            {nodes.map(node => {
-              const pos = positions[node.id] || { x: 200, y: 200 };
-              const isSelected = node.id === selectedNodeId;
-              const isInBlastRadius = blastRadiusNodes.includes(node.id);
-              const nodeColor = getNodeColor(node);
-              const isHoneypot = node.criticality === "Honeypot" || node.status === "DECOY";
-
-              return (
-                <g
-                  key={node.id}
-                  transform={`translate(${pos.x}, ${pos.y})`}
-                  className="cursor-pointer transition-transform duration-150"
-                  onMouseDown={(e) => handleMouseDownNode(e, node.id)}
-                >
-                  {(isSelected || node.status === "COMPROMISED" || isInBlastRadius) && (
-                    <circle
-                      r="32"
-                      fill="none"
-                      stroke={node.status === "COMPROMISED" ? "#ef4444" : (isSelected ? "#00f3ff" : "#f97316")}
-                      strokeWidth={isSelected ? "3" : "2"}
-                      strokeDasharray={node.status === "COMPROMISED" ? "4 3" : "none"}
-                      className={node.status === "COMPROMISED" ? "animate-pulse" : ""}
-                    />
-                  )}
-
-                  {isHoneypot && (
-                    <circle
-                      r="28"
-                      fill="none"
-                      stroke="#f59e0b"
-                      strokeWidth="1.5"
-                      strokeDasharray="2 2"
-                      opacity="0.6"
-                      className="animate-spin"
-                      style={{ animationDuration: '8s' }}
-                    />
-                  )}
-
+              {blastRadiusNodes.length > 0 && selectedNodeId && positions[selectedNodeId] && (
+                <g>
                   <circle
-                    r="22"
-                    fill="#0d1424"
-                    stroke={nodeColor}
-                    strokeWidth="2.5"
-                    filter="url(#neon-glow)"
+                    cx={positions[selectedNodeId].x}
+                    cy={positions[selectedNodeId].y}
+                    r="190"
+                    fill="rgba(239, 68, 68, 0.05)"
+                    stroke="rgba(239, 68, 68, 0.3)"
+                    strokeWidth="1.5"
+                    strokeDasharray="6 4"
+                    className="animate-pulse"
                   />
-
-                  <foreignObject x="-12" y="-12" width="24" height="24" className="pointer-events-none">
-                    <div className="w-full h-full flex items-center justify-center">
-                      {getNodeIcon(node)}
-                    </div>
-                  </foreignObject>
-
-                  <rect
-                    x="-45"
-                    y="27"
-                    width="90"
-                    height="18"
-                    rx="4"
-                    fill="#080e1c"
-                    stroke={nodeColor}
+                  <circle
+                    cx={positions[selectedNodeId].x}
+                    cy={positions[selectedNodeId].y}
+                    r="340"
+                    fill="rgba(239, 68, 68, 0.02)"
+                    stroke="rgba(239, 68, 68, 0.15)"
                     strokeWidth="1"
+                    strokeDasharray="8 6"
                   />
-                  <text
-                    x="0"
-                    y="40"
-                    textAnchor="middle"
-                    fill="#e2e8f0"
-                    fontSize="9.5"
-                    fontWeight="600"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {node.name.length > 14 ? node.name.substring(0, 13) + '…' : node.name}
-                  </text>
-
-                  <text
-                    x="0"
-                    y="55"
-                    textAnchor="middle"
-                    fill="#64748b"
-                    fontSize="8.5"
-                    fontFamily="monospace"
-                    className="select-none pointer-events-none"
-                  >
-                    {node.ip}
-                  </text>
                 </g>
-              );
-            })}
-          </g>
-        </svg>
+              )}
 
+              {edges.map(edge => {
+                const srcPos = positions[edge.source];
+                const tgtPos = positions[edge.target];
+                if (!srcPos || !tgtPos) return null;
+
+                const isQuarantined = edge.status === "QUARANTINED";
+                const isDeceptive = edge.status === "DECEPTIVE";
+                const isBlastEdge = blastRadiusNodes.includes(edge.source) && blastRadiusNodes.includes(edge.target);
+                
+                let strokeColor = "#00f3ff80";
+                let marker = "url(#arrow-active)";
+                let dash = "none";
+
+                if (isQuarantined) {
+                  strokeColor = "#475569";
+                  marker = "url(#arrow-quarantined)";
+                  dash = "4 4";
+                } else if (isDeceptive) {
+                  strokeColor = "#f59e0b";
+                  marker = "url(#arrow-deceptive)";
+                  dash = "3 3";
+                } else if (isBlastEdge) {
+                  strokeColor = "#ef4444";
+                  marker = "url(#arrow-compromised)";
+                }
+
+                const midX = (srcPos.x + tgtPos.x) / 2;
+                const midY = (srcPos.y + tgtPos.y) / 2;
+
+                return (
+                  <g key={edge.id} className="transition-all duration-300">
+                    <line
+                      x1={srcPos.x}
+                      y1={srcPos.y}
+                      x2={tgtPos.x}
+                      y2={tgtPos.y}
+                      stroke={strokeColor}
+                      strokeWidth={isBlastEdge ? 2.5 : (isDeceptive ? 1.8 : 1.5)}
+                      strokeDasharray={dash}
+                      markerEnd={marker}
+                    />
+                    <rect
+                      x={midX - 28}
+                      y={midY - 9}
+                      width="56"
+                      height="18"
+                      rx="4"
+                      fill="#080e1c"
+                      stroke={strokeColor}
+                      strokeWidth="0.8"
+                      opacity="0.9"
+                    />
+                    <text
+                      x={midX}
+                      y={midY + 3.5}
+                      textAnchor="middle"
+                      fill={isQuarantined ? "#94a3b8" : (isDeceptive ? "#fbbf24" : "#a5f3fc")}
+                      fontSize="9"
+                      fontFamily="monospace"
+                      className="select-none pointer-events-none"
+                    >
+                      {edge.protocol || edge.relationship}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {nodes.map(node => {
+                const pos = positions[node.id] || { x: 200, y: 200 };
+                const isSelected = node.id === selectedNodeId;
+                const isInBlastRadius = blastRadiusNodes.includes(node.id);
+                const nodeColor = getNodeColor(node);
+                const isHoneypot = node.criticality === "Honeypot" || node.status === "DECOY";
+
+                return (
+                  <g
+                    key={node.id}
+                    transform={`translate(${pos.x}, ${pos.y})`}
+                    className="cursor-pointer transition-transform duration-150"
+                    onMouseDown={(e) => handleMouseDownNode(e, node.id)}
+                  >
+                    {(isSelected || node.status === "COMPROMISED" || node.status === "ISOLATED" || isInBlastRadius) && (
+                      <circle
+                        r="32"
+                        fill="none"
+                        stroke={
+                          node.status === "COMPROMISED" ? "#ef4444" : 
+                          node.status === "ISOLATED" ? "#94a3b8" : 
+                          isSelected ? "#00f3ff" : "#f97316"
+                        }
+                        strokeWidth={node.status === "ISOLATED" ? "2.5" : (isSelected ? "3" : "2")}
+                        strokeDasharray={
+                          node.status === "COMPROMISED" ? "4 3" : 
+                          node.status === "ISOLATED" ? "3 3" : "none"
+                        }
+                        className={node.status === "COMPROMISED" ? "animate-pulse" : ""}
+                        style={node.status === "ISOLATED" ? { filter: "drop-shadow(0 0 8px #a855f7)" } : undefined}
+                      />
+                    )}
+
+                    {isHoneypot && (
+                      <circle
+                        r="28"
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="2 2"
+                        opacity="0.6"
+                        className="animate-spin"
+                        style={{ animationDuration: '8s' }}
+                      />
+                    )}
+
+                    <circle
+                      r="22"
+                      fill="#0d1424"
+                      stroke={nodeColor}
+                      strokeWidth="2.5"
+                      filter="url(#neon-glow)"
+                    />
+
+                    <foreignObject x="-12" y="-12" width="24" height="24" className="pointer-events-none">
+                      <div className="w-full h-full flex items-center justify-center">
+                        {getNodeIcon(node)}
+                      </div>
+                    </foreignObject>
+
+                    <rect
+                      x="-45"
+                      y="27"
+                      width="90"
+                      height="18"
+                      rx="4"
+                      fill="#080e1c"
+                      stroke={nodeColor}
+                      strokeWidth="1"
+                    />
+                    <text
+                      x="0"
+                      y="40"
+                      textAnchor="middle"
+                      fill="#e2e8f0"
+                      fontSize="9.5"
+                      fontWeight="600"
+                      fontFamily="monospace"
+                      className="select-none pointer-events-none"
+                    >
+                      {node.name.length > 14 ? node.name.substring(0, 13) + '…' : node.name}
+                    </text>
+
+                    <text
+                      x="0"
+                      y="55"
+                      textAnchor="middle"
+                      fill="#64748b"
+                      fontSize="8.5"
+                      fontFamily="monospace"
+                      className="select-none pointer-events-none"
+                    >
+                      {node.ip}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        )}
+
+        {/* Selected Node Details Drawer */}
         {selectedNode && (
           <div className="absolute bottom-4 right-4 w-84 bg-[#0d1322]/95 border border-cyan-500/40 rounded-lg p-3.5 shadow-2xl backdrop-blur-md z-20 text-xs">
             <div className="flex items-center justify-between border-b border-slate-700/80 pb-2 mb-2.5">
@@ -539,6 +747,7 @@ export default function GraphView({
         )}
       </div>
 
+      {/* Visualizer Footer Legend */}
       <div className="px-4 py-2 bg-[#090e1c] border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
         <div className="flex items-center space-x-4">
           <div className="flex items-center space-x-1.5">
@@ -564,10 +773,9 @@ export default function GraphView({
         </div>
 
         <span className="text-slate-500 font-mono">
-          Interactive Drag & Zoom • Click node for GraphOps actions
+          {engineMode === "force" ? "Interactive Force Graph Mode" : "Cytoscape.js Physics Layout Mode"}
         </span>
       </div>
     </div>
   );
 }
-

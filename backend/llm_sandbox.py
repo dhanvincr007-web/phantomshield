@@ -22,8 +22,8 @@ SHELL_STATE = {
 }
 
 MITRE_TECHNIQUE_RULES = [
-    (r"\b(whoami|id)\b", "T1033", "System Owner/User Discovery", "Reconnaissance"),
-    (r"\b(uname|hostname|cat\s+/etc/os-release|cat\s+/etc/issue)\b", "T1082", "System Information Discovery", "Discovery"),
+    (r"\b(whoami|id)\b", "T1033", "System Owner/User Discovery", "Discovery"),
+    (r"\b(uname|hostname|cat\s+/etc/os-release|cat\s+/etc/issue)\b", "TA0007", "System Information Discovery", "Discovery"),
     (r"\b(cat\s+/etc/passwd|cat\s+/etc/shadow|unshadow)\b", "T1003.008", "OS Credential Dumping: /etc/passwd and /etc/shadow", "Credential Access"),
     (r"\b(ls|dir|find|tree)\b", "T1083", "File and Directory Discovery", "Discovery"),
     (r"\b(netstat|ss|ip\s+addr|ifconfig|arp|route)\b", "T1049", "System Network Connections Discovery", "Discovery"),
@@ -136,13 +136,16 @@ def handle_deception_command(command: str) -> Dict[str, Any]:
             "Reading canary file /var/backup/shadow.kdbx...\n"
             "KeePass 2.x Database Header Found: Signature=0x9AA2D903\n"
             "Stored Keys: 'Honey-CRM-Database' (mysql://admin:P@ssw0rdDecoy99@10.0.2.99:3306)\n"
-            "AWS Keys: 'AKIA_HONEY_DECEPTION_PROD' [TRAPPED]"
+            "AWS Synthetic Credential: 'AKIA_CANARY_PHANTOM_99' [CANARY ALERT TRIPPED]\n"
+            "Target Decoy Host: decoy-ssh-01 (10.0.1.99)"
         )
         alert_triggered = True
-        alert_details = "CRITICAL: Attacker accessed Canary File 'Canary-File-Passwd'. Decoy credentials captured!"
+        alert_details = "CRITICAL: Attacker accessed Canary File 'Canary-File-Passwd'. Canary Alert AKIA_CANARY_PHANTOM_99 triggered!"
         update_node_status("Canary-File-Passwd", "DECOY_TRIGGERED", notes="Canary file read by attacker")
         update_node_status("Honey-CRM-Database", "ALERTED", notes="Decoy DB target exposed to attacker")
-        graph_update = {"node_id": "Canary-File-Passwd", "status": "DECOY_TRIGGERED"}
+        update_node_status("decoy-ssh-01", "COMPROMISED", notes="Decoy SSH server breached via credential dump")
+        update_node_status("Honey-Bastion-SSH", "COMPROMISED", notes="Decoy SSH server breached via credential dump")
+        graph_update = {"node_id": "decoy-ssh-01", "status": "COMPROMISED"}
 
     elif "aws_iam_backup.env" in cmd or ("env" in cmd and "aws" in cmd):
         response_text = (
